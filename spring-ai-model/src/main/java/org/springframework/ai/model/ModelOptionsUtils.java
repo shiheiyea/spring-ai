@@ -68,11 +68,11 @@ import org.springframework.util.ObjectUtils;
 public abstract class ModelOptionsUtils {
 
 	public static final ObjectMapper OBJECT_MAPPER = JsonMapper.builder()
-		.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-		.disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
-		.addModules(JacksonUtils.instantiateAvailableModules())
-		.build()
-		.configure(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT, true);
+			.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+			.disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
+			.addModules(JacksonUtils.instantiateAvailableModules())
+			.build()
+			.configure(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT, true);
 
 	static {
 		// Configure coercion for empty strings to null for Enum types
@@ -181,26 +181,34 @@ public abstract class ModelOptionsUtils {
 			source = Map.of();
 		}
 
+		// 如果调用方指定了 acceptedFieldNames，直接使用该列表作为允许保留的字段名。
 		List<String> requestFieldNames = CollectionUtils.isEmpty(acceptedFieldNames)
+				// 通过 REQUEST_FIELD_NAMES_PER_CLASS 缓存池
+				// 调用 ModelOptionsUtils::getJsonPropertyValues 反射提取目标类 clazz 上所有标注了 @JsonProperty 的 JSON key 名字（如 "temperature"、"max_tokens"、"top_p" 等）。
 				? REQUEST_FIELD_NAMES_PER_CLASS.computeIfAbsent(clazz, ModelOptionsUtils::getJsonPropertyValues)
 				: acceptedFieldNames;
 
+		// 利用 Jackson 的 ObjectMapper.convertValue(obj, Map.class) 将源对象和目标对象转换为标准的键值对 Map。
 		if (CollectionUtils.isEmpty(requestFieldNames)) {
 			throw new IllegalArgumentException("No @JsonProperty fields found in the " + clazz.getName());
 		}
 
+		// 利用 Jackson 的 ObjectMapper.convertValue(obj, Map.class) 将源对象和目标对象转换为标准的键值对 Map。
+		// 无论入参是 Map、通用的 ChatOptions 接口实现，还是模型专有的 Options 实体，转换后统一变成以 JSON 字段名为 Key 的键值对结构，无需关心具体的 Java 继承层级。
 		Map<String, Object> sourceMap = ModelOptionsUtils.objectToMap(source);
 		Map<String, Object> targetMap = ModelOptionsUtils.objectToMap(target);
 
+		// 1. 非空覆盖：source 覆盖 target
 		targetMap.putAll(sourceMap.entrySet()
-			.stream()
-			.filter(e -> e.getValue() != null)
-			.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
+				.stream()
+				.filter(e -> e.getValue() != null)
+				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
 
+		// 2. 白名单清洗：过滤掉不属于目标类的字段
 		targetMap = targetMap.entrySet()
-			.stream()
-			.filter(e -> requestFieldNames.contains(e.getKey()))
-			.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+				.stream()
+				.filter(e -> requestFieldNames.contains(e.getKey()))
+				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
 		return ModelOptionsUtils.mapToClass(targetMap, clazz);
 	}
@@ -234,11 +242,11 @@ public abstract class ModelOptionsUtils {
 			String json = OBJECT_MAPPER.writeValueAsString(source);
 			return OBJECT_MAPPER.readValue(json, new TypeReference<Map<String, Object>>() {
 
-			})
-				.entrySet()
-				.stream()
-				.filter(e -> e.getValue() != null)
-				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+					})
+					.entrySet()
+					.stream()
+					.filter(e -> e.getValue() != null)
+					.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 		}
 		catch (JsonProcessingException e) {
 			throw new RuntimeException(e);
@@ -293,20 +301,23 @@ public abstract class ModelOptionsUtils {
 	 * instance.
 	 */
 	public static <I, S extends I, T extends S> T copyToTarget(S sourceBean, Class<I> sourceInterfaceClazz,
-			Class<T> targetBeanClazz) {
+															   Class<T> targetBeanClazz) {
 
 		Assert.notNull(sourceInterfaceClazz, "SourceOptionsClazz must not be null");
 		Assert.notNull(targetBeanClazz, "TargetOptionsClazz must not be null");
 
+		// 若上层并未配置任何 options（传入 null），直接短路返回 null，避免无谓的实例构建与反射。
 		if (sourceBean == null) {
 			return null;
 		}
 
+		// 检查源对象本身是否已经是目标类型（或目标类型的子类）。如果是，无需发生任何反射和复制，直接强转返回原生对象，降低内存分配与性能开销。
 		if (sourceBean.getClass().isAssignableFrom(targetBeanClazz)) {
 			return (T) sourceBean;
 		}
 
 		try {
+			// 通过目标类的无参构造器 targetBeanClazz.getConstructor().newInstance() 反射创建目标对象的新实例。因此，目标类必须提供无参构造函数。
 			T targetOptions = targetBeanClazz.getConstructor().newInstance();
 
 			ModelOptionsUtils.mergeBeans(sourceBean, targetOptions, sourceInterfaceClazz, true);
@@ -335,24 +346,34 @@ public abstract class ModelOptionsUtils {
 	 * @return the merged target object.
 	 */
 	public static <I, S extends I, T extends S> T mergeBeans(S source, T target, Class<I> sourceInterfaceClazz,
-			boolean overrideNonNullTargetValues) {
+															 boolean overrideNonNullTargetValues) {
 		Assert.notNull(source, "Source object must not be null");
 		Assert.notNull(target, "Target object must not be null");
 
+		// 采用 Spring 框架核心的 BeanWrapperImpl 分别包装两个对象。
+		// BeanWrapper 提供了标准 JavaBean 的读写抽象（自动处理 getter/setter 匹配及必要的基础类型转换），避免手写原始反射调用。
 		BeanWrapper sourceBeanWrap = new BeanWrapperImpl(source);
 		BeanWrapper targetBeanWrap = new BeanWrapperImpl(target);
 
+		// 获取传入接口 sourceInterfaceClazz 中定义的所有方法名称列表。
+		// 这是实现“接口隔离”的关键。如果 source 是一个包含了 20 个私有扩展属性的具体实现类，
+		// 但 sourceInterfaceClazz 接口中只定义了 5 个规范方法，则只有这 5 个方法对应的属性会被纳入合并范围，其余字段直接忽略。
 		List<String> interfaceNames = Arrays.stream(sourceInterfaceClazz.getMethods()).map(m -> m.getName()).toList();
 
+		// getPropertyDescriptors() 返回源对象所有的 JavaBean 属性（包含属性名及对应的读写方法）。
 		for (PropertyDescriptor descriptor : sourceBeanWrap.getPropertyDescriptors()) {
 
+			// 排除不需要合并的黑名单字段（例如常见的 class 属性，即 getClass() 衍生出的只读属性）。
+			// 检查该属性对应的 Getter 方法（通过工具方法 toGetName 将属性名如 model 转换为 getModel）是否存在于前面提取的接口方法列表中。
+			// 只有符合接口定义的规范属性才允许放行。
 			if (!BEAN_MERGE_FIELD_EXCISIONS.contains(descriptor.getName())
 					&& interfaceNames.contains(toGetName(descriptor.getName()))) {
 
 				String propertyName = descriptor.getName();
 				Object value = sourceBeanWrap.getPropertyValue(propertyName);
 
-				// Copy value to the target object
+				// Copy value to the target object’
+				// 确保源对象中未配置的属性（值为 null）绝不会覆盖或清空目标对象已有的配置。
 				if (value != null) {
 					var targetValue = targetBeanWrap.getPropertyValue(propertyName);
 
@@ -385,10 +406,10 @@ public abstract class ModelOptionsUtils {
 
 			SchemaGeneratorConfigBuilder configBuilder = new SchemaGeneratorConfigBuilder(SchemaVersion.DRAFT_2020_12,
 					OptionPreset.PLAIN_JSON)
-				.with(Option.EXTRA_OPEN_API_FORMAT_VALUES)
-				.with(Option.PLAIN_DEFINITION_KEYS)
-				.with(swaggerModule)
-				.with(jacksonModule);
+					.with(Option.EXTRA_OPEN_API_FORMAT_VALUES)
+					.with(Option.PLAIN_DEFINITION_KEYS)
+					.with(swaggerModule)
+					.with(jacksonModule);
 
 			if (KotlinDetector.isKotlinReflectPresent()) {
 				configBuilder.with(new KotlinModule());

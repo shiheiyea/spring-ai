@@ -233,93 +233,132 @@ public class DeepSeekChatModel implements ChatModel {
 
 	public Flux<ChatResponse> internalStream(Prompt prompt, ChatResponse previousChatResponse) {
 		return Flux.deferContextual(contextView -> {
+			// 根据 prompt 构建发送给 DeepSeek 的请求体，第二个参数 true 代表启用 SSE 流式传输 (stream: true)
 			ChatCompletionRequest request = createRequest(prompt, true);
 
+			// 调用底层 HTTP 客户端发起 POST 请求，返回一个持续吐出 chunk 数据块的 Flux 响应式流
 			Flux<DeepSeekApi.ChatCompletionChunk> completionChunks = this.deepSeekApi.chatCompletionStream(request);
 
+			// 线程安全的哈希表，用于缓存并共享响应块的角色（解决流式下后续 chunk 的 role 字段为 null 的问题）
 			// For chunked responses, only the first chunk contains the choice role.
 			// The rest of the chunks with same ID share the same role.
 			ConcurrentHashMap<String, String> roleMap = new ConcurrentHashMap<>();
 
+			// 构建 Micrometer Observation 观测上下文，记录当前模型供应商（DeepSeek）和初始 Prompt 元数据
 			final ChatModelObservationContext observationContext = ChatModelObservationContext.builder()
-				.prompt(prompt)
-				.provider(DeepSeekConstants.PROVIDER_NAME)
-				.build();
+					.prompt(prompt)
+					.provider(DeepSeekConstants.PROVIDER_NAME)
+					.build();
 
+			// 创建 Observation 监控实例，用于打点采集吞吐、延迟、错误率等指标
 			Observation observation = ChatModelObservationDocumentation.CHAT_MODEL_OPERATION.observation(
 					this.observationConvention, DEFAULT_OBSERVATION_CONVENTION, () -> observationContext,
 					this.observationRegistry);
 
+			// 从 Reactor 响应式上下文中提取父级 Observation（如果有），建立父子 Span 树状追踪关系，并启动耗时监控计时
 			observation.parentObservation(contextView.getOrDefault(ObservationThreadLocalAccessor.KEY, null)).start();
 
+			// 对底层 API 返回的原始 Chunk 流进行处理：先将每个 Chunk 转换为标准的 ChatCompletion 对象
 			Flux<ChatResponse> chatResponse = completionChunks.map(this::chunkToChatCompletion)
-				.switchMap(chatCompletion -> Mono.just(chatCompletion).map(chatCompletion2 -> {
-					try {
-						String id = chatCompletion2.id();
+					// switchMap：将每个 completion 对象包裹为 Mono，并在转换时处理元数据与异常
+					.switchMap(chatCompletion -> Mono.just(chatCompletion).map(chatCompletion2 -> {
+						try {
+							// 获取当前数据块的全局唯一 ID（同一轮对话流的所有 chunk 共享同一个 ID）
+							String id = chatCompletion2.id();
 
-						List<Generation> generations = chatCompletion2.choices().stream().map(choice -> {
-							if (choice.message().role() != null) {
-								roleMap.putIfAbsent(id, choice.message().role().name());
-							}
+							// 遍历模型给出的分支选项 choices，将其封装为 Spring AI 统一的 Generation 生成结果列表
+							List<Generation> generations = chatCompletion2.choices().stream().map(choice -> {
+								// SSE 协议中通常只有首个 chunk 带有 role（如 "assistant"），后续 chunk 的 role 为 null
+								if (choice.message().role() != null) {
+									// 命中首个 chunk 时，将 role 登记到 roleMap 中
+									roleMap.putIfAbsent(id, choice.message().role().name());
+								}
 
-				// @formatter:off
+								// @formatter:off
+								// 构造当前 chunk 的元数据：带上响应 ID、从 roleMap 回查的角色名、以及完成状态（如 STOP、TOOL_CALLS）
 								Map<String, Object> metadata = Map.of(
 										"id", chatCompletion2.id(),
 										"role", roleMap.getOrDefault(id, ""),
 										"finishReason", choice.finishReason() != null ? choice.finishReason().name() : ""
 								);
-  				// @formatter:on
-							return buildGeneration(choice, metadata);
-						}).toList();
-						DeepSeekApi.Usage usage = chatCompletion2.usage();
-						Usage currentUsage = (usage != null) ? getDefaultUsage(usage) : new EmptyUsage();
-						Usage cumulativeUsage = UsageCalculator.getCumulativeUsage(currentUsage, previousChatResponse);
+								// @formatter:on
+								// 结合原始 choice 数据与 metadata，构造成 Spring AI 规范的 Generation 实例
+								return buildGeneration(choice, metadata);
+							}).toList();
 
-						return new ChatResponse(generations, from(chatCompletion2, cumulativeUsage));
-					}
-					catch (Exception e) {
-						logger.error("Error processing chat completion", e);
-						return new ChatResponse(List.of());
-					}
+							// 提取模型返回的 Token 用量（通常仅流的最后一个 chunk 会包含 usage 字段）
+							DeepSeekApi.Usage usage = chatCompletion2.usage();
+							// 若当前 chunk 有 usage 则解析，否则用空的 EmptyUsage 占位
+							Usage currentUsage = (usage != null) ? getDefaultUsage(usage) : new EmptyUsage();
+							// 将当前 chunk 消耗与上一轮工具调用的累积 Token 合并累加，得出全局真实的 token 消耗
+							Usage cumulativeUsage = UsageCalculator.getCumulativeUsage(currentUsage, previousChatResponse);
 
-				}));
+							// 组装并返回封装好的 ChatResponse
+							return new ChatResponse(generations, from(chatCompletion2, cumulativeUsage));
+						}
+						catch (Exception e) {
+							// 捕获并记录单个 chunk 转换过程中的异常，降级返回一个包含空列表的 ChatResponse 防止流被硬中断
+							logger.error("Error processing chat completion", e);
+							return new ChatResponse(List.of());
+						}
+
+					}));
 
 			// @formatter:off
+			// 响应式扁平化映射：针对流中吐出的每个 ChatResponse 检查是否需要执行外部工具（Function Calling）
 			Flux<ChatResponse> flux = chatResponse.flatMap(response -> {
-				if (this.toolExecutionEligibilityPredicate.isToolExecutionRequired(prompt.getOptions(), response)) {
-					// FIXME: bounded elastic needs to be used since tool calling
-					//  is currently only synchronous
-					return Flux.deferContextual(ctx -> {
-						ToolExecutionResult toolExecutionResult;
-						try {
-							ToolCallReactiveContextHolder.setContext(ctx);
-							toolExecutionResult = this.toolCallingManager.executeToolCalls(prompt, response);
-						}
-						finally {
-							ToolCallReactiveContextHolder.clearContext();
-						}
-						if (toolExecutionResult.returnDirect()) {
-							// Return tool execution result directly to the client.
-							return Flux.just(ChatResponse.builder().from(response)
-									.generations(ToolExecutionResult.buildGenerations(toolExecutionResult))
-									.build());
+						// 断言判断：根据当前用户设定的选项以及响应内容（例如是否存在 tool_calls），判断是否需触发本地工具执行
+						if (this.toolExecutionEligibilityPredicate.isToolExecutionRequired(prompt.getOptions(), response)) {
+							// FIXME 说明：由于当前大部分 Java 工具实现是阻塞同步代码，需要切换到弹性线程池避免阻塞 Netty
+							// 再次使用 deferContextual 以便捕获并向下游工具传递上下文
+							// FIXME: bounded elastic needs to be used since tool calling
+							//  is currently only synchronous
+							return Flux.deferContextual(ctx -> {
+								ToolExecutionResult toolExecutionResult;
+								try {
+									// 将 Reactor 上下文存入 ThreadLocal 桥接器，使工具内部方法（如安全凭据、租户上下文）能获取到参数
+									ToolCallReactiveContextHolder.setContext(ctx);
+									// 同步反射执行 @Tool 方法（如数据库查询、外部 HTTP 调用），返回执行结果
+									toolExecutionResult = this.toolCallingManager.executeToolCalls(prompt, response);
+								}
+								finally {
+									// 清理 ThreadLocal，防止线程复用带来的内存泄漏与上下文串话
+									ToolCallReactiveContextHolder.clearContext();
+								}
+								// 分支 1：如果工具被配置为“直接返回”（returnDirect = true），无需大模型二次组织语言
+								if (toolExecutionResult.returnDirect()) {
+									// Return tool execution result directly to the client.
+									// 将工具执行结果构造成 Generation，直接封装为 ChatResponse 输出给下游客户端
+									return Flux.just(ChatResponse.builder().from(response)
+											.generations(ToolExecutionResult.buildGenerations(toolExecutionResult))
+											.build());
+								}
+								// 分支 2：经典工具循环 —— 将工具的执行返回值作为 ToolMessage 放入历史记录，再次发起流式请求让模型总结
+								else {
+									// 递归调用自身 internalStream，带入新的对话上下文并传递当前 response 作为前序 response 供 token 累加
+									// Send the tool execution result back to the model.
+									return this.internalStream(new Prompt(toolExecutionResult.conversationHistory(), prompt.getOptions()),
+											response);
+								}
+
+								// 将阻塞的工具执行逻辑切换至 boundedElastic（弹性阻塞线程池），杜绝占用 Reactor 核心 EventLoop 线程
+							}).subscribeOn(Schedulers.boundedElastic());
 						}
 						else {
-							// Send the tool execution result back to the model.
-							return this.internalStream(new Prompt(toolExecutionResult.conversationHistory(), prompt.getOptions()),
-									response);
+							// 不需要执行工具，直接将模型的文本输出 chunk 正常向下游流式分发
+							return Flux.just(response);
 						}
-					}).subscribeOn(Schedulers.boundedElastic());
-				}
-				else {
-					return Flux.just(response);
-				}
-			})
-			.doOnError(observation::error)
-			.doFinally(s -> observation.stop())
-			.contextWrite(ctx -> ctx.put(ObservationThreadLocalAccessor.KEY, observation));
+					})
+					// 流发生异常时，向 Micrometer Observation 记录异常信息
+					.doOnError(observation::error)
+					// 无论流正常结束 (onComplete) 还是异常/被客户端取消 (cancel)，都停止观测指标计时并提交 Trace Span
+					.doFinally(s -> observation.stop())
+					// 将当前 observation 对象写入 Reactor 上下文，供链路中下游的其他反应式算子共享追踪信息
+					.contextWrite(ctx -> ctx.put(ObservationThreadLocalAccessor.KEY, observation));
 			// @formatter:on
 
+			// 使用 MessageAggregator 对流中的碎片进行聚合：
+			// 既保证下游能继续实时收到流式 chunk，又在后台聚合成完整的全量响应传给 observationContext 记录监控日志
 			return new MessageAggregator().aggregate(flux, observationContext::setResponse);
 
 		});
