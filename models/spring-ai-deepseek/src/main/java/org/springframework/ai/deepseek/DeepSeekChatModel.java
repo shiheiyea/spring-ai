@@ -432,7 +432,9 @@ public class DeepSeekChatModel implements ChatModel {
 	Prompt buildRequestPrompt(Prompt prompt) {
 		DeepSeekChatOptions runtimeOptions = null;
 		if (prompt.getOptions() != null) {
+			// 调用方传入的 options 可能是通用的 ChatOptions，也可能是支持工具调用的 ToolCallingChatOptions，甚至是第三方模型 options。
 			if (prompt.getOptions() instanceof ToolCallingChatOptions toolCallingChatOptions) {
+				// 按 ToolCallingChatOptions 接口定义的属性，将配置复制到 DeepSeekChatOptions。
 				runtimeOptions = ModelOptionsUtils.copyToTarget(toolCallingChatOptions, ToolCallingChatOptions.class,
 						DeepSeekChatOptions.class);
 			}
@@ -442,29 +444,37 @@ public class DeepSeekChatModel implements ChatModel {
 			}
 		}
 
+		// 运行时覆盖默认值（Runtime options 覆盖 Default options）
 		DeepSeekChatOptions requestOptions = ModelOptionsUtils.merge(runtimeOptions, this.defaultOptions,
 				DeepSeekChatOptions.class);
 
 		if (runtimeOptions != null) {
+			// 1. 是否由客户端内部自动执行工具调用（布尔值优先取运行时）
 			requestOptions.setInternalToolExecutionEnabled(
 					ModelOptionsUtils.mergeOption(runtimeOptions.getInternalToolExecutionEnabled(),
 							this.defaultOptions.getInternalToolExecutionEnabled()));
+			// 2. 优先使用运行时工具名称；运行时为空时回退到默认值（Set 会去重）
 			requestOptions.setToolNames(ToolCallingChatOptions.mergeToolNames(runtimeOptions.getToolNames(),
 					this.defaultOptions.getToolNames()));
+			// 3. 优先使用运行时工具回调；运行时为空时回退到默认回调
 			requestOptions.setToolCallbacks(ToolCallingChatOptions.mergeToolCallbacks(runtimeOptions.getToolCallbacks(),
 					this.defaultOptions.getToolCallbacks()));
+			// 4. 合并工具上下文：默认 Map 为基础，运行时同名键覆盖（浅合并）
 			requestOptions.setToolContext(ToolCallingChatOptions.mergeToolContext(runtimeOptions.getToolContext(),
 					this.defaultOptions.getToolContext()));
 		}
 		else {
+			// 若没有运行时配置，直接回退并继承全部默认工具配置
 			requestOptions.setInternalToolExecutionEnabled(this.defaultOptions.getInternalToolExecutionEnabled());
 			requestOptions.setToolNames(this.defaultOptions.getToolNames());
 			requestOptions.setToolCallbacks(this.defaultOptions.getToolCallbacks());
 			requestOptions.setToolContext(this.defaultOptions.getToolContext());
 		}
 
+		// 校验工具回调名称是否重复
 		ToolCallingChatOptions.validateToolCallbacks(requestOptions.getToolCallbacks());
 
+		// 保留原始 prompt 中的消息列表 (Instructions)，换上合并后最终确定的 requestOptions
 		return new Prompt(prompt.getInstructions(), requestOptions);
 	}
 
